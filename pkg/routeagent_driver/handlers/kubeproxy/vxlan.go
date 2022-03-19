@@ -295,5 +295,30 @@ func (kp *SyncHandler) createVxLANInterface(activeEndPoint string, ifaceType int
 		return errors.Wrap(err, "failed to configure vxlan interface ipaddress on the Gateway Node")
 	}
 
+	if ifaceType == VxInterfaceWorker {
+		// TODO: ANF: if MultiActiveGatewayEnabled
+		nextHopId := netlinkAPI.GetNextHopId()
+		klog.Infof("Attempting to create nexthop for vxlan interface on non-Gateway Node nextHopID: %d, GwIP: %s, nextHopDev: %s", nextHopId, kp.vxlanGwIP.String(), VxLANIface)
+		err = netlinkAPI.CreateNextHop(nextHopId, kp.vxlanGwIP.String(), VxLANIface)
+		if err != nil {
+			klog.Infof("failed to create nexthop for vxlan interface on non-Gateway Node: %v", err)
+			return errors.Wrap(err, "failed to create nexthop for vxlan interface on non-Gateway Node: %v")
+		}
+		kp.nextHopIDs = append(kp.nextHopIDs, nextHopId)
+		klog.Infof("created nexthop for vxlan interface on non-Gateway Node")
+
+		// TODO: ANF: We should pre-create the next hop group, and then add next hops to it as the tunnels are created.
+		nextHopGroupID := netlinkAPI.GetNextHopId()
+		klog.Infof("Attempting to create nextHopGroup for vxlan interface on non-Gateway Node nextHopGroupID: %d, nextHops: %v", nextHopGroupID, []int{nextHopId})
+		err = netlinkAPI.CreateNextHopGroup(nextHopGroupID, []int{nextHopId})
+		if err != nil {
+			klog.Infof("failed to create nexthop group for vxlan interfaces on non-Gateway Node: %v", err)
+			return errors.Wrap(err, "failed to create nexthop group for vxlan interfaces on non-Gateway Node: %v")
+		} else {
+			kp.nextHopGroupID = nextHopGroupID
+			klog.Infof("created nextHopGroup for vxlan interface on non-Gateway Node")
+		}
+	}
+
 	return nil
 }

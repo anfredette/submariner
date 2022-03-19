@@ -54,14 +54,14 @@ func (kp *SyncHandler) LocalEndpointCreated(endpoint *submV1.Endpoint) error {
 			return errors.Wrap(err, "failed to derive the remoteVtepIP")
 		}
 
+		kp.vxlanGwIP = &remoteVtepIP
+
 		klog.Infof("Creating the vxlan interface %s with gateway node IP %s", VxLANIface, localClusterGwNodeIP)
 
 		err = kp.createVxLANInterface(endpoint.Spec.Hostname, VxInterfaceWorker, localClusterGwNodeIP)
 		if err != nil {
 			klog.Fatalf("Unable to create VxLAN interface on non-GatewayNode (%s): %v", endpoint.Spec.Hostname, err)
 		}
-
-		kp.vxlanGwIP = &remoteVtepIP
 
 		err = kp.reconcileRoutes(remoteVtepIP)
 		if err != nil {

@@ -55,6 +55,9 @@ type SyncHandler struct {
 	hostname         string
 	cniIface         *cni.Interface
 	defaultHostIface *net.Interface
+
+	nextHopGroupID int
+	nextHopIDs     []int
 }
 
 func NewSyncHandler(localClusterCidr, localServiceCidr []string) *SyncHandler {

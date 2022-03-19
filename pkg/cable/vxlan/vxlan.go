@@ -70,6 +70,8 @@ type vxlanIface struct {
 	activeEndpointHostname string
 	link                   *netlink.Vxlan
 	vtepIP                 net.IP
+	nextHopGroupID         int
+	nextHopIDs             []int
 }
 
 type vxlanAttributes struct {
@@ -318,6 +320,33 @@ func (v *vxlan) ConnectToEndpoint(endpointInfo *natdiscovery.NATEndpointInfo) (s
 		ipAddress = nil
 	}
 
+	// We create next hop groups on gateways regardless of whether MultiActiveGatewayEnabled == true on the local cluster
+	// because it may be enabled in the remote cluster.
+	// TODO: We should evaluate whether there is a performance hit, and if so, whether it would be better to not create
+	// TODO: the group until we learn that a peer cluster is using more than one gateway.
+	// TODO: The following code is basically a no-op if the nexthop creation fails. In a real implementation, we should
+	// TODO: fail and return an error.
+	nextHopId := netlinkAPI.GetNextHopId()
+	klog.Infof("Attempting to create nexthop for vxlan interface on non-Gateway Node nextHopID: %d, GwIP: %s, nextHopDev: %s", nextHopId, remoteVtepIP.String(), VxlanIface)
+	err = netlinkAPI.CreateNextHop(nextHopId, remoteVtepIP.String(), VxlanIface)
+	if err != nil {
+		klog.Infof("failed to create nexthop for vxlan interface on non-Gateway Node: %v", err)
+	} else {
+		klog.Infof("created nexthop for vxlan interface on non-Gateway Node")
+		v.vxlanIface.nextHopIDs = append(v.vxlanIface.nextHopIDs, nextHopId)
+
+		// TODO: ANF: We should pre-create the next hop group, and then add next hops to it as the tunnels are created.
+		nextHopGroupID := netlinkAPI.GetNextHopId()
+		klog.Infof("Attempting to create nextHopGroup for vxlan interface on non-Gateway Node nextHopGroupID: %d, nextHops: %v", nextHopGroupID, []int{nextHopId})
+		err = netlinkAPI.CreateNextHopGroup(nextHopGroupID, []int{nextHopId})
+		if err != nil {
+			klog.Infof("failed to create nexthop group for vxlan interfaces on non-Gateway Node: %v", err)
+		} else {
+			v.vxlanIface.nextHopGroupID = nextHopGroupID
+			klog.Infof("created nextHopGroup for vxlan interface on non-Gateway Node")
+		}
+	}
+
 	err = v.vxlanIface.AddRoute(allowedIPs, remoteVtepIP, ipAddress)
 
 	if err != nil {
@@ -480,27 +509,45 @@ func (v *vxlanIface) DelFDB(ipAddress net.IP, hwAddr string) error {
 
 func (v *vxlanIface) AddRoute(ipAddressList []net.IPNet, gwIP, ip net.IP) error {
 	for i := range ipAddressList {
-		route := &netlink.Route{
-			LinkIndex: v.link.Index,
-			Src:       ip,
-			Dst:       &ipAddressList[i],
-			Gw:        gwIP,
-			Type:      netlink.NDA_DST,
-			Flags:     netlink.NTF_SELF,
-			Priority:  100,
-			Table:     TableID,
-		}
-		err := netlink.RouteAdd(route)
+		if v.nextHopGroupID == 0 {
+			route := &netlink.Route{
+				LinkIndex: v.link.Index,
+				Src:       ip,
+				Dst:       &ipAddressList[i],
+				Gw:        gwIP,
+				Type:      netlink.NDA_DST,
+				Flags:     netlink.NTF_SELF,
+				Priority:  100,
+				Table:     TableID,
+			}
+			err := netlink.RouteAdd(route)
+			if errors.Is(err, syscall.EEXIST) {
+				err = netlink.RouteReplace(route)
+			}
+			if err != nil {
+				return errors.Wrapf(err, "unable to add the route entry %v", route)
+			}
+			klog.Infof("Successfully added route with netlink.RouteAdd for entry %v and gw ip %v", route, gwIP)
+		} else {
+			route := &netlink.Route{
+				LinkIndex: v.link.Index,
+				Src:       ip,
+				Dst:       &ipAddressList[i],
+				Gw:        gwIP,
+				Type:      netlink.NDA_DST,
+				Flags:     netlink.NTF_SELF,
+				Priority:  100,
+				Table:     TableID,
+			}
 
-		if errors.Is(err, syscall.EEXIST) {
-			err = netlink.RouteReplace(route)
-		}
+			//func RouteAddNextHopGw(network string, nhID int, source string, metric int, table int) error {
+			err := netlinkAPI.RouteAddNextHop(ipAddressList[i].String(), v.nextHopGroupID, TableID, 100, -1, -1, ip.String())
+			if err != nil {
+				return errors.Wrapf(err, "unable to add the route entry %v", route)
+			}
 
-		if err != nil {
-			return errors.Wrapf(err, "unable to add the route entry %v", route)
+			klog.Infof("Successfully added route with RouteAddNextHop for entry %v and gw ip %v", route, gwIP)
 		}
-
-		klog.V(log.DEBUG).Infof("Successfully added the route entry %v and gw ip %v", route, gwIP)
 	}
 
 	return nil

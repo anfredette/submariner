@@ -26,6 +26,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/submariner-io/admiral/pkg/log"
 	"github.com/submariner-io/submariner/pkg/cable/wireguard"
+	netlinkAPI "github.com/submariner-io/submariner/pkg/netlink"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/constants"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -222,6 +223,7 @@ func (kp *SyncHandler) reconcileRoutes(vxlanGw net.IP) error {
 		found := false
 
 		for i := range currentRouteList {
+			// TODO: ANF: Figure out what to do with the currentRouteList
 			if currentRouteList[i].Gw == nil || currentRouteList[i].Dst == nil {
 			} else if currentRouteList[i].Gw.Equal(route.Gw) && currentRouteList[i].Dst.String() == route.Dst.String() {
 				klog.V(log.DEBUG).Infof("Found equivalent route, not adding")
@@ -230,9 +232,16 @@ func (kp *SyncHandler) reconcileRoutes(vxlanGw net.IP) error {
 		}
 
 		if !found {
-			err = kp.netLink.RouteAdd(&route)
-			if err != nil {
-				klog.Errorf("Error adding route %s: %v", route, err)
+			if kp.nextHopGroupID == 0 {
+				err = kp.netLink.RouteAdd(&route)
+				if err != nil {
+					klog.Errorf("Error adding route %s: %v", route, err)
+				}
+			} else {
+				err = netlinkAPI.RouteAddNextHop(cidrBlock, kp.nextHopGroupID, -1, -1, 4, -1, "")
+				if err != nil {
+					klog.Errorf("Error adding route %s: %v", route, err)
+				}
 			}
 		}
 	}
@@ -288,9 +297,16 @@ func (kp *SyncHandler) updateRoutingRulesForInterClusterSupport(remoteCIDRs []st
 			}
 
 			if operation == Add {
-				err = kp.netLink.RouteAdd(&route)
-				if err != nil {
-					return errors.Wrapf(err, "error adding route %s", route)
+				if kp.nextHopGroupID == 0 {
+					err = kp.netLink.RouteAdd(&route)
+					if err != nil {
+						return errors.Wrapf(err, "error adding route %s", route)
+					}
+				} else {
+					err = netlinkAPI.RouteAddNextHop(cidrBlock, kp.nextHopGroupID, -1, -1, 4, unix.RT_SCOPE_UNIVERSE, "")
+					if err != nil {
+						return errors.Wrapf(err, "error adding route %s", route)
+					}
 				}
 			} else if operation == Delete {
 				err = kp.netLink.RouteDel(&route)
