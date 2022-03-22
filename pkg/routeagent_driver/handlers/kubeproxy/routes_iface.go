@@ -121,20 +121,27 @@ func (kp *SyncHandler) configureRoute(remoteSubnet string, operation Operation, 
 	}
 
 	route := netlink.Route{
-		Dst:       dst,
-		Src:       src,
+		Dst:      dst,
+		Src:      src,
+		Protocol: 4,
+		Table:    constants.RouteAgentHostNetworkTableID,
+	}
+
+	// MultiPath  []*NexthopInfo
+
+	nexthopInfo := netlink.NexthopInfo{
 		LinkIndex: ifaceIndex,
-		Protocol:  4,
-		Table:     constants.RouteAgentHostNetworkTableID,
 	}
 
 	// in some cases we need to specify the next hop (for example when the remote ipsec endpoint
 	// belongs in the remote cluster CIDR of the rule) ( see issue #1106 )
 	if viaGw != nil {
-		route.Gw = *viaGw
+		nexthopInfo.Gw = *viaGw
 	} else {
 		route.Scope = unix.RT_SCOPE_LINK
 	}
+
+	route.MultiPath = append(route.MultiPath, &nexthopInfo)
 
 	switch operation {
 	case Add:
@@ -212,12 +219,17 @@ func (kp *SyncHandler) reconcileRoutes(vxlanGw net.IP) error {
 		}
 
 		route := netlink.Route{
-			Dst:       dst,
-			Gw:        vxlanGw,
-			Scope:     unix.RT_SCOPE_UNIVERSE,
-			LinkIndex: link.Attrs().Index,
-			Protocol:  4,
+			Dst:      dst,
+			Scope:    unix.RT_SCOPE_UNIVERSE,
+			Protocol: 4,
 		}
+
+		nexthopInfo := netlink.NexthopInfo{
+			LinkIndex: link.Attrs().Index,
+			Gw:        vxlanGw,
+		}
+
+		route.MultiPath = append(route.MultiPath, &nexthopInfo)
 
 		found := false
 
@@ -261,50 +273,66 @@ func (kp *SyncHandler) removeUnknownRoutes(vxlanGw net.IP, currentRouteList []ne
 }
 
 func (kp *SyncHandler) updateRoutingRulesForInterClusterSupport(remoteCIDRs []string, operation Operation) error {
+	klog.Infof("ANF: updateRoutingRulesForInterClusterSupport: %+v, %+v", remoteCIDRs, operation)
+
 	if kp.isGatewayNode {
-		klog.V(log.DEBUG).Info("On GWNode, in updateRoutingRulesForInterClusterSupport ignoring")
+		klog.Info("ANF: On GWNode, in updateRoutingRulesForInterClusterSupport ignoring")
 		// These rules are required only on the nonGatewayNode.
 		return nil
 	}
 
-	// Update internal Loadbalancing Groups
-	for _, gwIp := range kp.gwIPs.Elements() {
+	klog.Infof("ANF: gwIPs: len: %+v, size: %+v", len(kp.gwIPs.Elements()), kp.gwIPs.Size())
+
+	if kp.vxlanDevice == nil || len(kp.gwIPs.Elements()) == 0 {
+		return nil
+	}
+
+	link, err := kp.netLink.LinkByName(VxLANIface)
+	if err != nil {
+		return errors.Wrapf(err, "error retrieving link by name %s", VxLANIface)
+	}
+
+	multiPath := make([]*netlink.NexthopInfo, len(kp.gwIPs.Elements()))
+	multiPathData := make([]netlink.NexthopInfo, len(kp.gwIPs.Elements()))
+
+	for i, gwIp := range kp.gwIPs.Elements() {
 		vxlanGwIP, err := getVxlanVtepIPAddress(gwIp)
 		if err != nil {
-			return errors.Wrap(err, "failed to derive the remoteVtepIP")
+			return errors.Wrap(err, "ANF: failed to derive the remoteVtepIP")
 		}
 
-		if kp.vxlanDevice != nil && vxlanGwIP != nil {
-			link, err := kp.netLink.LinkByName(VxLANIface)
+		multiPathData[i] = netlink.NexthopInfo{
+			LinkIndex: link.Attrs().Index,
+			Gw:        vxlanGwIP,
+		}
+		multiPath[i] = &multiPathData[i]
+	}
+
+	klog.Infof("ANF: multiPath: %+v, multiPathData: %+v", multiPath, multiPathData)
+
+	// Update internal Loadbalancing Groups
+	for _, cidrBlock := range remoteCIDRs {
+		_, dst, err := net.ParseCIDR(cidrBlock)
+		if err != nil {
+			return errors.Wrapf(err, "error parsing cidr block %s", cidrBlock)
+		}
+
+		route := netlink.Route{
+			Dst:       dst,
+			Scope:     unix.RT_SCOPE_UNIVERSE,
+			Protocol:  4,
+			MultiPath: multiPath,
+		}
+
+		if operation == Add {
+			err = kp.netLink.RouteAdd(&route)
 			if err != nil {
-				return errors.Wrapf(err, "error retrieving link by name %s", VxLANIface)
+				return errors.Wrapf(err, "error adding route %s", route)
 			}
-
-			for _, cidrBlock := range remoteCIDRs {
-				_, dst, err := net.ParseCIDR(cidrBlock)
-				if err != nil {
-					return errors.Wrapf(err, "error parsing cidr block %s", cidrBlock)
-				}
-
-				route := netlink.Route{
-					Dst:       dst,
-					Gw:        vxlanGwIP,
-					Scope:     unix.RT_SCOPE_UNIVERSE,
-					LinkIndex: link.Attrs().Index,
-					Protocol:  4,
-				}
-
-				if operation == Add {
-					err = kp.netLink.RouteAdd(&route)
-					if err != nil {
-						return errors.Wrapf(err, "error adding route %s", route)
-					}
-				} else if operation == Delete {
-					err = kp.netLink.RouteDel(&route)
-					if err != nil {
-						return errors.Wrapf(err, "error deleting route %s", route)
-					}
-				}
+		} else if operation == Delete {
+			err = kp.netLink.RouteDel(&route)
+			if err != nil {
+				return errors.Wrapf(err, "error deleting route %s", route)
 			}
 		}
 	}

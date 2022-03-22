@@ -106,6 +106,7 @@ func (n *netlinkType) NeighList(linkIndex, family int) ([]netlink.Neigh, error) 
 }
 
 func (n *netlinkType) RouteAdd(route *netlink.Route) error {
+	klog.Infof("ANF: RouteAdd: %+v", route)
 	return netlink.RouteAdd(route)
 }
 
